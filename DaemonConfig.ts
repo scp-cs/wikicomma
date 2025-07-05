@@ -43,7 +43,7 @@ export interface IDaemonConfig {
 	http_proxy?: {address: string, port: number}
 	socks_proxy?: {address: string, port: number}
 	blacklist?: string[]
-	zmq_url?: string
+	scuttle_url?: string
 }
 
 export class DaemonConfig implements IDaemonConfig {
@@ -58,7 +58,7 @@ export class DaemonConfig implements IDaemonConfig {
 	public http_proxy?: {address: string, port: number}
 	public socks_proxy?: {address: string, port: number}
 	public blacklist?: string[]
-	public zmq_url?: string
+	public scuttle_url?: string
 
 	constructor(loader: IDaemonConfig) {
 		this.base_directory = loader.base_directory
@@ -70,7 +70,7 @@ export class DaemonConfig implements IDaemonConfig {
 		this.http_proxy = loader.http_proxy
 		this.socks_proxy = loader.socks_proxy
 		this.blacklist = loader.blacklist
-		this.zmq_url = loader.zmq_url
+		this.scuttle_url = loader.scuttle_url
 
 		for (const i in this.wikis) {
 			let url = this.wikis[i].url

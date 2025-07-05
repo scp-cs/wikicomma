@@ -27,7 +27,7 @@ import { loadConfig } from './DaemonConfig'
 
 import http = require('http')
 import https = require('https')
-import { ZmqSender } from './ZmqSender'
+import { ScuttleConnector } from './ScuttleConnector'
 
 (async function() {
 	const config = await loadConfig()
@@ -65,7 +65,7 @@ import { ZmqSender } from './ZmqSender'
 						userList,
 						true,
 						config.blacklist,
-						config.zmq_url ? new ZmqSender(name, config.zmq_url) : null
+						config.scuttle_url ? new ScuttleConnector(name, config.scuttle_url) : null
 					)
 
 					await wiki.fetchToken()

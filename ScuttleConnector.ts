@@ -51,39 +51,36 @@ export interface MessageData {
     errorStr?: string
 }
 
-export class ZmqSender {
-    private socket: zmq.Push
+export class ScuttleConnector {
 
     private log(message: string) {
-        console.log(`[zmq-${this.tag}]: ${message}`);
+        console.log(`[con-${this.tag}]: ${message}`);
     }
 
-    private send(message: zmq.MessageLike) {
-        // TODO: Better error handling
-        if(this.socket.writable) {
-            this.socket.send(message)
-        } else {
-            this.log("ERROR: Socket busy")
-        }
+    private async send(message: Object) {
+        await fetch(this.address+"/backup/status", {
+            method: "POST",
+            body: JSON.stringify(message)
+        }).catch(e => {this.log("Exception: " + e)})
     }
 
-    public sendMessage(type: MessageType, data?: MessageData) {
+    public async sendMessage(type: MessageType, data?: MessageData) {
         switch (type) {
             case MessageType.Handshake:
             case MessageType.FinishSuccess:
             case MessageType.PageDone:
             case MessageType.PagePostponed:
-                this.send(JSON.stringify({"tag": this.tag, "type": type}))
+                await this.send(JSON.stringify({"tag": this.tag, "type": type}))
                 break;
 
             case MessageType.Preflight:
-                this.send(JSON.stringify({"tag": this.tag, "type": type, "total": data?.total}))
+                await this.send(JSON.stringify({"tag": this.tag, "type": type, "total": data?.total}))
                 break;
             
             case MessageType.Progress:
             case MessageType.ErrorFatal:
             case MessageType.ErrorNonfatal:
-                this.send(JSON.stringify({"tag": this.tag, "type": type, ...data}))
+                await this.send(JSON.stringify({"tag": this.tag, "type": type, ...data}))
                 break;
 
             default:
@@ -93,13 +90,11 @@ export class ZmqSender {
     }
 
     constructor(private tag: string, private address: string) {
-        this.socket = new zmq.Push()
+        
     }
 
-    public init() {
-        this.socket.connect(this.address)
-        this.log(`Connected to ${this.address}`)
+    public async init() {
         this.log("Sending handshake message")
-        this.sendMessage(MessageType.Handshake)
+        await this.sendMessage(MessageType.Handshake)
     }
 }
