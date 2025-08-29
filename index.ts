@@ -27,6 +27,7 @@ import { loadConfig } from './DaemonConfig'
 
 import http = require('http')
 import https = require('https')
+import { ScuttleConnector } from './ScuttleConnector'
 
 (async function() {
 	const config = await loadConfig()
@@ -63,7 +64,8 @@ import https = require('https')
 						config.makeQueue(),
 						userList,
 						true,
-						config.blacklist
+						config.blacklist,
+						config.scuttle_url ? new ScuttleConnector(name, config.scuttle_url) : null
 					)
 
 					await wiki.fetchToken()

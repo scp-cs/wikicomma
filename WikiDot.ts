@@ -30,6 +30,7 @@ import { addZipFiles, listZipFiles } from "./7z-helper"
 import { OutgoingHttpHeaders } from "http2"
 import { blockingQueue, parallel, PromiseQueue } from "./worker"
 import { WikiDotUserList } from "./WikidotUserList"
+import { MessageType, Status, ScuttleConnector, ErrorKind, MessageData } from "./ScuttleConnector"
 
 const sleep = promisify(setTimeout)
 
@@ -148,21 +149,6 @@ export function removeFromSet<T>(set: T[], value: T) {
 	}
 
 	return indexOf != -1
-}
-
-export function flipArray<T>(input: T[]): T[] {
-	let i = 0
-	let j = input.length - 1
-
-	while (i < j) {
-		const value = input[j]
-		input[j] = input[i]
-		input[i] = value
-		i++
-		j--
-	}
-
-	return input
 }
 
 export interface ForumCategory {
@@ -645,7 +631,8 @@ export class WikiDot {
 		public queue: PromiseQueue | null,
 		public userList: WikiDotUserList | null,
 		handleCookies = true,
-		private blacklist: string[] = []
+		private blacklist: string[] = [],
+		private connector: ScuttleConnector | null = null
 	) {
 		this.ajaxURL = new URL(`${this.url}/ajax-module-connector.php`)
 		this.startMetaSyncTimer()
@@ -769,6 +756,7 @@ export class WikiDot {
 				if (!locked) {
 					this.tokenInvalidated = true
 					this.error(`!!! Wikidot invalidated our token, waiting 30 seconds....`)
+					this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorTokenInvalidated})
 					await sleep(30_000)
 
 					this.client.cookies.removeSpecific(this.ajaxURL, 'wikidot_token7')
@@ -1876,12 +1864,25 @@ export class WikiDot {
 		return list2
 	}
 
+	private async sendStatusMessage(type: MessageType, data?: MessageData) {
+		if(this.connector) {
+			await this.connector.sendMessage(type, data)
+		}
+	}
+
+	// Work loop starts here
 	public async workLoop(lock: Lock) {
+		if(this.connector) {
+			this.connector.init()
+		}
+
 		if (this.client === null || this.queue === null) {
+			this.sendStatusMessage(MessageType.ErrorFatal, {errorKind: ErrorKind.ErrorClientOffline})
 			throw new Error(`This object is in offline mode`)
 		}
 
 		await this.initialize()
+		this.sendStatusMessage(MessageType.Progress, {status: Status.BuildingSitemap})
 
 		{
 			let mapNeedsRebuild = true
@@ -1913,6 +1914,7 @@ export class WikiDot {
 								this.pageIdMap.data[metadata.page_id] = metadata.name
 								this.pageIdMap.markDirty()
 							} else {
+								this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind:ErrorKind.ErrorMalformedSitemap})
 								this.error(`${this._workingDirectory}/meta/pages/${name} is malformed!`)
 							}
 						})
@@ -1992,6 +1994,7 @@ export class WikiDot {
 		}
 
 		this.log(`Counting total ${sitemapPages.length} pages`)
+		this.sendStatusMessage(MessageType.Preflight, {total: sitemapPages.length})
 
 		const oldMap = await this.readSiteMap()
 
@@ -2026,15 +2029,25 @@ export class WikiDot {
 			}
 		}
 
+
+		this.sendStatusMessage(MessageType.Progress, {status: Status.PagesMain, done: 0, postponed: 0})
 		const tasks: any[] = []
+		
+		let done = 0
+		let postponed = 0
 
 		for (const [pageName, pageUpdate] of sitemapPages) {
 			tasks.push(async () => {
+
+				// Check if we already finished the file during a previous run
 				if (oldMap != null) {
 					const oldStamp = oldMap.get(pageName)
 
 					if (oldStamp === pageUpdate || pageUpdate != null && oldStamp === pageUpdate.getTime()) {
 						if (await this.pageMetadataExists(pageName)) {
+							if(this.connector) {
+								done++
+							}
 							// consider it fetched, since sitemap is written to disk only when everything got saved
 							return
 						}
@@ -2059,7 +2072,8 @@ export class WikiDot {
 					try {
 						pageMeta = await this.fetchGeneric(pageName)
 					} catch(err) {
-						this.log(`Encountered ${err}, postproning page ${pageName} for late fetch`)
+						postponed++
+						this.log(`Encountered ${err}, postponing page ${pageName} for late fetch`)
 						this.pushPendingPages(pageName)
 						return
 					}
@@ -2114,6 +2128,7 @@ export class WikiDot {
 								newMeta.votings = await this.fetchPageVoters(pageMeta.page_id)
 								break
 							} catch(err) {
+								this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorVoteFetch, name: pageName})
 								this.error(`Encountered error fetching ${pageName} voters: ${err}`)
 							}
 						}
@@ -2139,6 +2154,7 @@ export class WikiDot {
 											this.log(`File ${emeta.file_id} <${emeta.url}> inside ${pageName} <${pageMeta.page_id}> got removed`)
 											await promises.unlink(`${this._workingDirectory}/files/${pageName}/${emeta.file_id}`)
 										} catch(err) {
+											this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorFileUnlink, name: pageName})
 											this.error(String(err))
 										}
 									}
@@ -2146,6 +2162,7 @@ export class WikiDot {
 
 								break
 							} catch(err) {
+								this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorFileFetch, name: pageName})
 								this.error(`Encountered error fetching ${pageName} files: ${err}`)
 							}
 						}
@@ -2155,6 +2172,7 @@ export class WikiDot {
 								newMeta.is_locked = await this.fetchIsPageLocked(pageMeta.page_id)
 								break
 							} catch(err) {
+								this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorLockStatusFetch, name: pageName})
 								this.error(`Encountered error fetching ${pageName} "is locked" status: ${err}`)
 							}
 						}
@@ -2184,7 +2202,7 @@ export class WikiDot {
 				}
 
 				let changes = false
-				flipArray(revisionsToFetch)
+				revisionsToFetch.reverse()
 
 				const worker = async () => {
 					while (true) {
@@ -2209,7 +2227,8 @@ export class WikiDot {
 
 								break
 							} catch(err) {
-								this.error(`Encountered ${err}, postproning revision ${rev.global_revision} of ${pageName} for later fetch`)
+								postponed++
+								this.error(`Encountered ${err}, postponing revision ${rev.global_revision} of ${pageName} for later fetch`)
 								this.pendingRevisions.data[rev.global_revision] = metadata!.page_id
 								this.pendingRevisions.markDirty()
 							}
@@ -2225,13 +2244,28 @@ export class WikiDot {
 				if (changes) {
 					await this.compressRevisions(WikiDot.normalizeName(pageName))
 				}
+				done++
 			})
 		}
 
 		const worker = this.queue.blockingQueue(tasks)
+
+		const interval_id = setInterval(async () => {
+			console.log(`[${this.name}] - ${tasks.length} remaining`)
+			await this.sendStatusMessage(MessageType.Progress, {status: Status.PagesMain, done: done, postponed: postponed})
+		}, 10000);
+
 		await this.queue.run(worker, 8)
 
 		await this.writeSiteMap(sitemapPages)
+
+		clearInterval(interval_id); // Stop reporting on page progress
+
+		console.log("Sites done")
+
+		this.sendStatusMessage(MessageType.Progress, {status: Status.PagesMain, done: done, postponed: postponed})
+
+		this.sendStatusMessage(MessageType.Progress, {status: Status.ForumsMain})
 
 		this.log(`Fetching forums list`)
 
@@ -2240,6 +2274,7 @@ export class WikiDot {
 		try {
 			forums = await this.fetchForumCategories()
 		} catch(err) {
+			this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorForumListFetch})
 			this.error(`Error while fetching forum list: ${err}, will not try again`)
 			forums = []
 		}
@@ -2285,6 +2320,7 @@ export class WikiDot {
 							shouldFetch = count != thread.postsNum
 
 							if (shouldFetch) {
+								this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorForumCountMismatch})
 								this.error(`Post amount mismatch of ${thread.id} (expected ${thread.postsNum}, got ${count})`)
 							}
 
@@ -2292,6 +2328,7 @@ export class WikiDot {
 								localPostsAndRevisions = await this.readPostsAndRevisionsOfThread(forum.id, thread.id)
 
 								if (localPostsAndRevisions[0].length != count) {
+									this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorForumCountMismatch})
 									this.error(`Fetched post count mismatch of ${thread.id} (expected ${count}, got ${localPostsAndRevisions[0].length})`)
 									shouldFetch = true
 								}
@@ -2388,7 +2425,9 @@ export class WikiDot {
 											} catch(err) {
 												if (err instanceof HTTPError && err.response === 500) {
 													// slurp it, wikidot is hopeless
+													this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorWikidotInternal})
 												} else {
+													this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorForumPostFetch})
 													throw new Error(`Fetching revision ${revision.id} of post ${post.id}: ${err}`)
 												}
 											}
@@ -2513,6 +2552,8 @@ export class WikiDot {
 		// but if we managed to reach the end, then we gonna have fast index!
 		//await this.writeForumMeta(forums)
 
+		this.sendStatusMessage(MessageType.Progress, {status: Status.FilesPending})
+
 		if (this.pendingFiles.data.length != 0) {
 			this.log(`Fetching pending files`)
 
@@ -2536,6 +2577,7 @@ export class WikiDot {
 				}
 
 				if (mapped == undefined) {
+					this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorFileMetaFetch})
 					this.log(`Failed to map file meta ${id}`)
 					continue
 				}
@@ -2559,6 +2601,8 @@ export class WikiDot {
 				}
 			}
 		}
+
+		this.sendStatusMessage(MessageType.Progress, {status: Status.PagesPending})
 
 		{
 			const copy: [number, number][] = []
@@ -2585,6 +2629,7 @@ export class WikiDot {
 
 							if (metadata != null) {
 								if (metadata.page_id != num) {
+									this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorWhatTheFuck})
 									this.error(`yo dude what the fuck`)
 									this.error(`Page map match ID ${num} against ${page_name}, but ${page_name} in pages/ has ID of ${metadata.page_id}`)
 									this.pageIdMap.data[metadata.page_id] = metadata.name
@@ -2601,6 +2646,7 @@ export class WikiDot {
 					}
 
 					if (!hit) {
+						this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorMetaMissing})
 						this.error(`Unable to find page metadata for ${page_id}!!!`)
 					}
 				}
@@ -2612,6 +2658,7 @@ export class WikiDot {
 						const pageMeta = mapping.get(page_id)
 
 						if (pageMeta == undefined) {
+							this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorGivingUp, name: 'Unknown Page'})
 							this.error(`Unknown page with id ${page_id} when resolving pending revision! Considering revision ${global_revision} unresolvable.`)
 							delete this.pendingRevisions.data[global_revision]
 							this.pendingRevisions.markDirty()
@@ -2628,6 +2675,7 @@ export class WikiDot {
 						}
 
 						if (rev == undefined) {
+							this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorGivingUp, name: pageMeta.name})
 							this.error(`Unknown revision with id ${global_revision} inside ${pageMeta.name} (${[pageMeta.page_id]}) when resolving pending revision! Considering revision unresolvable.`)
 							delete this.pendingRevisions.data[global_revision]
 							this.pendingRevisions.markDirty()
@@ -2642,11 +2690,12 @@ export class WikiDot {
 							this.pendingRevisions.markDirty()
 						} catch(err) {
 							if (pageMeta.name.startsWith('nav:') || pageMeta.name.startsWith('tech:')) {
+								this.sendStatusMessage(MessageType.ErrorNonfatal, {errorKind: ErrorKind.ErrorGivingUp, name: pageMeta.name})
 								this.error(`Encountered ${err}, giving up on ${rev.global_revision} of ${pageMeta.name}`)
 								delete this.pendingRevisions.data[rev.global_revision]
 								this.pendingRevisions.markDirty()
 							} else {
-								this.error(`Encountered ${err}, postproning revision ${rev.global_revision} of ${pageMeta.name} for later fetch (AGAIN)`)
+								this.error(`Encountered ${err}, postponing revision ${rev.global_revision} of ${pageMeta.name} for later fetch (AGAIN)`)
 							}
 						}
 					})
@@ -2658,6 +2707,8 @@ export class WikiDot {
 				this.log(`Fetched all pending revisions!`)
 			}
 		}
+
+		this.sendStatusMessage(MessageType.Progress, {status: Status.Compressing})
 
 		this.log(`Compressing page revisions`)
 
@@ -2691,6 +2742,10 @@ export class WikiDot {
 					}
 				}
 			}
+		}
+
+		if(this.connector) {
+			this.connector.sendMessage(MessageType.FinishSuccess)
 		}
 	}
 
